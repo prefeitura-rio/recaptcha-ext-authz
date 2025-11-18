@@ -6,7 +6,7 @@ metadata:
   labels:
     app: recaptcha-authz
   annotations:
-    reloader.stakater.com/auto: "true"
+    secrets.infisical.com/auto-reload: "true"
 spec:
   replicas: 1
   selector:
