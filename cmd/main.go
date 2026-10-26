@@ -83,98 +83,50 @@ func (s *ExtAuthzServer) allow(request *authv3.CheckRequest) *authv3.CheckRespon
 
 func (s *ExtAuthzServer) deny(request *authv3.CheckRequest) *authv3.CheckResponse {
 	s.logRequest("denied", request)
+	// No debug headers are returned to the client on denied responses; the
+	// decision details are only kept in the server logs (see logRequest).
 	return &authv3.CheckResponse{
 		HttpResponse: &authv3.CheckResponse_DeniedResponse{
 			DeniedResponse: &authv3.DeniedHttpResponse{
 				Status: &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden},
 				Body:   denyBody,
-				Headers: []*corev3.HeaderValueOption{
-					{
-						Header: &corev3.HeaderValue{
-							Key:   resultHeader,
-							Value: resultDenied,
-						},
-					},
-					{
-						Header: &corev3.HeaderValue{
-							Key:   receivedHeader,
-							Value: returnIfNotTooLong(request.GetAttributes().String()),
-						},
-					},
-				},
 			},
 		},
 		Status: &status.Status{Code: int32(codes.PermissionDenied)},
 	}
 }
 
+// logDenyDetails logs, server-side, the reCAPTCHA decision details that used to
+// be exposed to clients through X-Recaptcha-* response headers.
+func (s *ExtAuthzServer) logDenyDetails(authResponse *service.AuthorizationResponse) {
+	log.Printf("[gRPCv3][denied][details]: %s", denyDetails(authResponse, s.circuitBreakerState))
+}
+
+func (s *ExtAuthzServer) circuitBreakerState() string {
+	if s.service == nil {
+		return "unknown"
+	}
+	return s.service.GetCircuitBreakerState()
+}
+
+// denyDetails renders the decision details of a denied request for logging.
+func denyDetails(authResponse *service.AuthorizationResponse, cbState func() string) string {
+	health := "healthy"
+	cb := ""
+	if authResponse.Status == "degraded" || authResponse.Status == "circuit_breaker_open" {
+		health = "degraded"
+		cb = cbState()
+	}
+	return fmt.Sprintf("%s=%s x-recaptcha-status=%q x-recaptcha-score=%q x-recaptcha-cache=%q x-recaptcha-service-health=%q x-recaptcha-circuit-breaker-state=%q",
+		resultHeader, resultDenied, authResponse.Status, authResponse.Score, authResponse.Cache, health, cb)
+}
+
 func (s *ExtAuthzServer) denyWithDetails(request *authv3.CheckRequest, authResponse *service.AuthorizationResponse) *authv3.CheckResponse {
 	s.logRequest("denied", request)
 	
-	// Create headers with detailed information
-	headers := []*corev3.HeaderValueOption{
-		{
-			Header: &corev3.HeaderValue{
-				Key:   resultHeader,
-				Value: resultDenied,
-			},
-		},
-		{
-			Header: &corev3.HeaderValue{
-				Key:   receivedHeader,
-				Value: returnIfNotTooLong(request.GetAttributes().String()),
-			},
-		},
-		{
-			Header: &corev3.HeaderValue{
-				Key:   "X-Recaptcha-Status",
-				Value: authResponse.Status,
-			},
-		},
-	}
-	
-	// Add optional headers if present
-	if authResponse.Score != "" {
-		headers = append(headers, &corev3.HeaderValueOption{
-			Header: &corev3.HeaderValue{
-				Key:   "X-Recaptcha-Score",
-				Value: authResponse.Score,
-			},
-		})
-	}
-	
-	if authResponse.Cache != "" {
-		headers = append(headers, &corev3.HeaderValueOption{
-			Header: &corev3.HeaderValue{
-				Key:   "X-Recaptcha-Cache",
-				Value: authResponse.Cache,
-			},
-		})
-	}
-	
-	// Add service health information for degraded states
-	if authResponse.Status == "degraded" || authResponse.Status == "circuit_breaker_open" {
-		headers = append(headers, &corev3.HeaderValueOption{
-			Header: &corev3.HeaderValue{
-				Key:   "X-Recaptcha-Service-Health",
-				Value: "degraded",
-			},
-		})
-		headers = append(headers, &corev3.HeaderValueOption{
-			Header: &corev3.HeaderValue{
-				Key:   "X-Recaptcha-Circuit-Breaker-State",
-				Value: s.service.GetCircuitBreakerState(),
-			},
-		})
-	} else {
-		headers = append(headers, &corev3.HeaderValueOption{
-			Header: &corev3.HeaderValue{
-				Key:   "X-Recaptcha-Service-Health",
-				Value: "healthy",
-			},
-		})
-	}
-	
+	// Debug details are logged server-side only and never returned to the client.
+	s.logDenyDetails(authResponse)
+
 	// Provide more accurate error message based on status
 	var errorMessage string
 	switch authResponse.Status {
@@ -195,7 +147,6 @@ func (s *ExtAuthzServer) denyWithDetails(request *authv3.CheckRequest, authRespo
 			DeniedResponse: &authv3.DeniedHttpResponse{
 				Status: &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden},
 				Body:   errorMessage,
-				Headers: headers,
 			},
 		},
 		Status: &status.Status{Code: int32(codes.PermissionDenied)},
@@ -267,9 +218,7 @@ func (s *ExtAuthzServer) ServeHTTP(response http.ResponseWriter, request *http.R
 	// Extract reCAPTCHA token from header
 	token := request.Header.Get(recaptchaTokenHeader)
 	if token == "" {
-		log.Printf("[HTTP][denied]: %s", l)
-		response.Header().Set(resultHeader, resultDenied)
-		response.Header().Set(receivedHeader, l)
+		log.Printf("[HTTP][denied]: %s=%s %s=%s", resultHeader, resultDenied, receivedHeader, l)
 		response.WriteHeader(http.StatusForbidden)
 		_, _ = response.Write([]byte(denyBody))
 		return
@@ -287,8 +236,7 @@ func (s *ExtAuthzServer) ServeHTTP(response http.ResponseWriter, request *http.R
 	authResponse, err := s.service.Authorize(ctx, authReq)
 	if err != nil {
 		log.Printf("[HTTP] authorization error: %v", err)
-		response.Header().Set(resultHeader, resultDenied)
-		response.Header().Set(receivedHeader, l)
+		log.Printf("[HTTP][denied]: %s=%s %s=%s", resultHeader, resultDenied, receivedHeader, l)
 		response.WriteHeader(http.StatusForbidden)
 		_, _ = response.Write([]byte(denyBody))
 		return
@@ -301,27 +249,9 @@ func (s *ExtAuthzServer) ServeHTTP(response http.ResponseWriter, request *http.R
 		response.Header().Set(receivedHeader, l)
 		response.WriteHeader(http.StatusOK)
 	} else {
-		log.Printf("[HTTP][denied]: %s", l)
-		response.Header().Set(resultHeader, resultDenied)
-		response.Header().Set(receivedHeader, l)
-		
-		// Add detailed status information in headers
-		response.Header().Set("X-Recaptcha-Status", authResponse.Status)
-		if authResponse.Score != "" {
-			response.Header().Set("X-Recaptcha-Score", authResponse.Score)
-		}
-		if authResponse.Cache != "" {
-			response.Header().Set("X-Recaptcha-Cache", authResponse.Cache)
-		}
-		
-		// Add service health information for degraded states
-		if authResponse.Status == "degraded" || authResponse.Status == "circuit_breaker_open" {
-			response.Header().Set("X-Recaptcha-Service-Health", "degraded")
-			response.Header().Set("X-Recaptcha-Circuit-Breaker-State", s.service.GetCircuitBreakerState())
-		} else {
-			response.Header().Set("X-Recaptcha-Service-Health", "healthy")
-		}
-		
+		// Debug details are logged server-side only, never sent to the client.
+		log.Printf("[HTTP][denied]: %s %s=%s", denyDetails(authResponse, s.circuitBreakerState), receivedHeader, l)
+
 		// Provide more accurate error message based on status
 		var errorMessage string
 		switch authResponse.Status {
